@@ -1,0 +1,8 @@
+---
+layout: default
+title: DX12 텍스처 처리
+---
+
+# 🎨 DX12 Texture
+
+PSO, CB, Root Signature, UploadHeap 등 핵심 흐름.
