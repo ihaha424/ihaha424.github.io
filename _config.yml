@@ -1,23 +1,15 @@
 title: 개발 노트
-description: 학습 기록
-author: Dongmin
+description: 학습을 정리하는 블로그
 theme: jekyll-theme-hacker
+
+# study 폴더 안의 .md 파일을 페이지로 렌더링하기 위한 설정
 include:
   - study
+
 collections:
   study:
     output: true
     permalink: /:collection/:name
+
 markdown: kramdown
 highlighter: rouge
-
-plugins:
-  - jekyll-feed
-
-exclude:
-  - Gemfile
-  - Gemfile.lock
-  - node_modules
-  - vendor
-
-permalink: /:categories/:title
