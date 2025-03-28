@@ -1,0 +1,1576 @@
+# 시스템 프로그래밍
+
+1반 240059 김동민
+
+# 목차
+
+1. 멀티스레딩을 통한 성능 향상
+2. SIMD를 통한 성능 향상
+3. 기타 알고리즘을 통한 성능 향상
+
+### 최초 프레임 상태 및 교수님 샘플 프레임
+
+최초 프레임 상태: 평균 7프레임
+
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/d9779caa-c4de-4fcf-9f49-ac4dfb82828a/image.png)
+
+교수님 샘플 상태: 
+
+멀티 스레드:  85 ~ 90 프레임
+
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/36e04b15-a0f6-493c-ad65-2c47c56d0eb7/image.png)
+
+SIMD: 58 ~ 62 프레임
+
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/0a02379a-9ee3-45a3-9e8d-e08ec52a6dc8/image.png)
+
+멀티스레드 + SIMD: 360 ~ 370 프레임
+
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/9f3501c2-14f2-44a3-8638-e686a80d9c60/image.png)
+
+# 멀티쓰레딩을 통한 성능 향상
+
+1. 코드 분석 및 작업 분할
+    
+    먼저 MultiTread를 통해 어떤식으로 작업을 분할 할지 코드를 보면서 분석하였습니다.
+    
+    ```cpp
+    void CPU_Edge_Filter(char* pDest, DWORD dwDestPitch, const char* pSrc, DWORD dwImageWidth, DWORD dwImageHeight, DWORD dwSrcPitch) //Todo : 이거 쓰래딩 + SIMD로하면 끝
+    {
+    	DWORD	start_y = 0;
+    	DWORD	end_y = start_y + dwImageHeight;
+    
+    	for (DWORD y = start_y; y < end_y; y++)
+    	{
+    		for (DWORD x = 0; x < dwImageWidth; x++)
+    		{
+    			DWORD	dwPixel = SampleEdgePixel32_CPU_SIMD3_1(pSrc, dwImageWidth, dwImageHeight, dwSrcPitch, x, y, SAMPLE_MASK_3_3_LAPLACIAN, MASK_3_3_WIDTH, MASK_3_3_HEIGHT, MASK_3_3_CENTER_X, MASK_3_3_CENTER_Y);
+    			DWORD*	pDestColor = (DWORD*)(pDest + (x*4) + (y * dwDestPitch));
+    			*pDestColor = dwPixel;
+    		}
+    	}
+    }
+    ```
+    
+    위의 코드부분을 시작과 끝을 설정해서 멀티쓰래드로 구분하여 서로 겹치지 않은 영역을 작업을 하도록 생각을 하였습니다.
+    
+    또한 캐쉬친화도를 생각하여서 단순히 작업 단위를 쓰래드의 수에 맞게 x, y를 나누는 것이 아닌 y축만 나눔으로써 접근 하는 캐쉬친화적으로 작업단위를 생각하였습니다.
+    
+    처음에는 시도 차원에서 매 프래임 마다 쓰래드를  제 컴퓨터의 사향에 맞게 32개의 쓰래드로 만든 뒤, 전체 이미지의 y를 쓰래드의 수에 맞게 나눈뒤 나머지를 마지막에 더해주고 각각의 영역을 서로 침범하지 않도록 작업을 했습니다.
+    
+    초기의 코드라 코드가 남아있지 않지만 기록상으로 7프레임 → 15프레임정도로 올라갔었습니다.
+    
+     
+    
+2. Thread Pooling
+    
+    매 프레임시마다 생성을 하니 비효율적이고 쓰래드 생성 비용이 너무 많이 들어갔습니다. 이에 따라 미리 쓰래드를 만들어 두고 풀링을 통해 작업을 할당할 수있도록 Thread Pooling을 만들었습니다.
+    
+
+```cpp
+#include "pch.h"
+#include "ThreadPool.h"
+#include <sysinfoapi.h>
+#include <synchapi.h>
+#include <handleapi.h>
+#include <WinBase.h>
+
+ThreadPool* ThreadPool::instance = {};
+
+ThreadPool::ThreadPool()
+{
+	curThreadCount = CheckCurrentProccess();
+	threadList = new HANDLE[curThreadCount];
+	threadEventHandle = new THREAD_CONTEXT[curThreadCount];
+	completeEventList = new HANDLE[curThreadCount];
+}
+
+ThreadPool::~ThreadPool()
+{
+	for (DWORD i = 0; i < curThreadCount; i++)
+	{
+		SetEvent(threadEventHandle[i].hEventList[THREAD_EVENT_DESTROY]);
+	}
+	WaitForMultipleObjects(curThreadCount, threadList, TRUE, INFINITE);
+
+	for (DWORD i = 0; i < curThreadCount; i++)
+	{
+		for (DWORD j = 0; j < THREAD_EVENT_COUNT; j++)
+		{
+			CloseHandle(threadEventHandle[i].hEventList[j]);
+			threadEventHandle[i].hEventList[j] = nullptr;
+		}
+		CloseHandle(threadEventHandle[i].finishEvent);
+		threadEventHandle[i].finishEvent = nullptr;
+
+		CloseHandle(threadList[i]);
+		threadList[i] = nullptr;
+	}
+
+	delete threadList;
+	delete threadEventHandle;
+	delete completeEventList;
+}
+
+ThreadPool* ThreadPool::GetInstance()
+{
+	if (nullptr == instance)
+	{
+		instance = new ThreadPool();
+	}
+	return instance;
+}
+
+void ThreadPool::DeleteInstance()
+{
+	if (nullptr != instance)
+	{
+		delete instance;
+		instance = nullptr;
+	}
+}
+
+DWORD ThreadPool::CheckCurrentProccess()
+{
+	SYSTEM_INFO sysInfo;
+	GetSystemInfo(&sysInfo);
+	DWORD numberOfProccess = sysInfo.dwNumberOfProcessors;
+
+	if (numberOfProccess > MAX_THREAD_COUNT)
+		numberOfProccess = MAX_THREAD_COUNT;
+	return numberOfProccess;
+}
+
+```
+
+```cpp
+#pragma once
+#include <process.h>
+#include <minwindef.h>
+
+const DWORD MAX_THREAD_COUNT = 64;
+
+struct THREAD_ARG
+{
+	int num;
+	DWORD start_y;
+	DWORD end_y;
+	DWORD dwImageWidth;
+	DWORD dwImageHeight;
+	DWORD dwSrcPitch;
+	DWORD dwDestPitch;
+	char* pDest;
+	const char* pSrc;
+};
+
+enum THREAD_EVENT
+{
+	THREAD_EVENT_WAKEUP,
+	THREAD_EVENT_DESTROY,
+	THREAD_EVENT_COUNT
+};
+
+struct THREAD_CONTEXT
+{
+	THREAD_ARG argList = {};
+	HANDLE hEventList[THREAD_EVENT_COUNT];
+	HANDLE finishEvent;
+};
+
+class ThreadPool
+{
+private:
+	ThreadPool();
+	~ThreadPool();
+	static ThreadPool* instance;
+
+public:
+	HANDLE* threadList = { nullptr };
+	THREAD_CONTEXT* threadEventHandle = { nullptr };
+	HANDLE*	completeEventList = {nullptr};
+	BOOL	isFirst = FALSE;
+
+public:
+	static ThreadPool* GetInstance();
+	static void DeleteInstance();
+	DWORD curThreadCount;
+
+	DWORD CheckCurrentProccess();
+
+};
+
+```
+
+Thread Pooling은 접근하기 쉽도록 간단하게 싱글톤 형식으로 만들었습니다.
+
+또한 스레드 수를 최대한 맞추기 위하여 시스템의 논리 프로세서 수에 따라 스레드 풀의 크기를 동적으로 만들어 주었습니다.
+
+이렇게 함으로써 스레드 생성/소멸 오버헤드를 최소화 할 수 있었습니다.
+
+또한 이러한 스레드들의 동기화에 대해서는 커널객체를 통한 이벤트 방식을 사용했습니다.
+
+위 헤더 코드의 THREAD_EVENT를 통해 이벤트 전달과 삭제를 하고 메인 스레드에서는 워커 스레드들이 끝날때 까지 대기해주어서 각 프레임의 동기화를 맞추었습니다.
+
+```cpp
+void CPU_Edge_Filter_MultiThreed(char* pDest, DWORD dwDestPitch, const char* pSrc, DWORD dwImageWidth, DWORD dwImageHeight, DWORD dwSrcPitch) //Todo : 이거 쓰래딩 + SIMD로하면 끝
+{
+	DWORD	start_y = 0;
+	DWORD	end_y = start_y + dwImageHeight;
+
+	ThreadPool* instance = ThreadPool::GetInstance();
+	DWORD WorkingThreadCount = instance->curThreadCount;
+
+	DWORD	threadWorkingY = end_y / WorkingThreadCount;
+
+	if (FALSE == instance->isFirst)
+	{
+		for (DWORD i = 0; i < WorkingThreadCount; i++)
+		{
+			instance->threadEventHandle[i].argList.num = i;
+			instance->threadEventHandle[i].argList.start_y = i * threadWorkingY;
+			instance->threadEventHandle[i].argList.end_y = ((i + 1) * threadWorkingY);
+			if (i == WorkingThreadCount - 1)
+				instance->threadEventHandle[i].argList.end_y = end_y;
+			instance->threadEventHandle[i].argList.dwImageWidth = dwImageWidth;
+			instance->threadEventHandle[i].argList.dwImageHeight = dwImageHeight;
+			instance->threadEventHandle[i].argList.dwSrcPitch = dwSrcPitch;
+			instance->threadEventHandle[i].argList.dwDestPitch = dwDestPitch;
+			instance->threadEventHandle[i].argList.pDest = pDest;
+			instance->threadEventHandle[i].argList.pSrc = pSrc;
+
+			for (DWORD j = 0; j < THREAD_EVENT_COUNT; j++)
+			{
+				instance->threadEventHandle[i].hEventList[j] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+			}
+
+			instance->completeEventList[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);;
+			instance->threadEventHandle[i].finishEvent = instance->completeEventList[i];
+
+			UINT uiThreadID = i;
+			instance->threadList[i] = (HANDLE)_beginthreadex(nullptr, 0, WorkingThread, &(instance->threadEventHandle[i].argList), 0, &uiThreadID);
+		}
+		instance->isFirst = TRUE;
+	}
+
+	for (DWORD i = 0; i < WorkingThreadCount; i++)
+	{
+		SetEvent(instance->threadEventHandle[i].hEventList[THREAD_EVENT_WAKEUP]);
+	}
+
+	WaitForMultipleObjects(WorkingThreadCount, instance->completeEventList, TRUE, INFINITE);
+}
+
+UINT WorkingThread(LPVOID pArg)
+{
+	THREAD_CONTEXT* pThreadArg = (THREAD_CONTEXT*)pArg;
+	const HANDLE* phEventList = pThreadArg->hEventList;
+	while (1)
+	{
+		DWORD	dwEventIndex = WaitForMultipleObjects(THREAD_EVENT_COUNT, phEventList, FALSE, INFINITE);
+		switch (dwEventIndex)
+		{
+		case THREAD_EVENT_WAKEUP:
+			for (DWORD y = pThreadArg->argList.start_y; y < pThreadArg->argList.end_y; y++)
+			{
+				for (DWORD x = 0; x < pThreadArg->argList.dwImageWidth; x++)
+				{
+					DWORD	dwPixel = SampleEdgePixel32_CPU(pThreadArg->argList.pSrc, pThreadArg->argList.dwImageWidth, pThreadArg->argList.dwImageHeight, pThreadArg->argList.dwSrcPitch, x, y, SAMPLE_MASK_3_3_LAPLACIAN, MASK_3_3_WIDTH, MASK_3_3_HEIGHT, MASK_3_3_CENTER_X, MASK_3_3_CENTER_Y);
+					DWORD* pDestColor = (DWORD*)(pThreadArg->argList.pDest + (x * 4) + (y * pThreadArg->argList.dwDestPitch));
+					*pDestColor = dwPixel;
+				}
+			}
+			SetEvent(pThreadArg->finishEvent);
+			break;
+		case THREAD_EVENT_DESTROY:
+			goto lb_exit;
+		}
+	}
+	
+lb_exit:
+	_endthreadex(0);
+	return 0;
+}
+```
+
+처음 초기화 시 인자를 넣어주고 끝날 때 까지 각자의 영역만 사용 함으로써 최대한 캐쉬히트율을 높였습니다.
+
+멀티스레드만 적용 시킨 결과 85~90정도의 프레임까지 향상 시킬 수 있었습니다.
+
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/d614deb9-f189-4fdd-b11f-4846b0a2689a/image.png)
+
+# SIMD를 통한 성능 향상
+
+1. 코드 분석
+
+```cpp
+DWORD SampleEdgePixel32_CPU(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+{
+	int		src_start_x = sx - iMaskCenterX;
+
+	int		mask_start_x = 0;
+	int		mask_start_y = 0;
+
+	if (src_start_x < 0)
+		mask_start_x = 0 - src_start_x;
+
+	int		src_start_y = sy - iMaskCenterY;
+
+	if (src_start_y < 0)
+		mask_start_y = 0 - src_start_y;
+
+	int		src_end_x = src_start_x + iMaskWidth;
+	int		src_end_y = src_start_y + iMaskHeight;
+
+	if (src_start_x < 0)
+		src_start_x = 0;
+
+	if (src_start_y < 0)
+		src_start_y = 0;
+
+	if (src_end_x > iWidth)
+		src_end_x = iWidth;
+
+	if (src_end_y > iHeight)
+		src_end_y = iHeight;
+
+	int		sample_width = src_end_x - src_start_x;
+	int		sample_height = src_end_y - src_start_y;
+
+	int	color[4];
+	int	total_color[4] = {};
+
+	for (int y = 0; y < sample_height; y++)
+	{
+		for (int x = 0; x < sample_width; x++)
+		{
+			int weight = pMask[(x + mask_start_x) + (y + mask_start_y) * iMaskWidth];
+			DWORD* pPixel = (DWORD*)(pBits + ((x + src_start_x) << 2) + (y + src_start_y) * iPitch);
+
+			DWORD dwPixelIn = *pPixel;
+
+			color[3] = (int)((dwPixelIn & 0xff000000) >> 24);
+			color[2] = (int)((dwPixelIn & 0x00ff0000) >> 16);
+			color[1] = (int)((dwPixelIn & 0x0000ff00) >> 8);
+			color[0] = (int)(dwPixelIn & 0x000000ff);
+
+			for (int k = 0; k < 4; k++)
+			{
+				total_color[k] += (color[k] * weight);
+			}
+		}
+	}
+
+	int	bw = (int)(((float)total_color[2] * 0.3f) + ((float)total_color[1] * 0.59f) + ((float)total_color[0] * 0.11f));
+
+	bw = 255 - bw;
+
+	if (bw > 255)
+		bw = 255;
+
+	if (bw < 0)
+		bw = 0;
+
+	return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+}
+```
+
+위 코드가 주어진 예제 코드에서 가장 연산이 많이 들어가는 부분입니다. 모든 픽셀마다 주변 픽셀의 값을 weight값을 통해 경계건 검출을 하는 연산입니다.
+
+SIMD연산은 CPU 한번의 명령으로 여러 개의 데이터를 동시에 처리할 수 있게 해주는 기법으로 여러번 반복되는 연산을 SIMD로 처리해주면 속도를 향상 시킬 수 있을 것이라고 생각했습니다.
+
+- 방법 1.
+    
+    처음 시도한 방법은 색을 가져오는 부분 과 Weight값 연산, 총 컬러 색상 연산만 시도를 했습니다. 추출한 픽셀의 Weight값을 비트 마스크로 바꾸어서 연산을 해보았습니다.
+    
+    ```cpp
+    DWORD SampleEdgePixel32_CPU_SIMD(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+    {
+    	int		src_start_x = sx - iMaskCenterX;
+    	int		mask_start_x = 0;
+    	int		mask_start_y = 0;
+    
+    	if (src_start_x < 0)
+    		mask_start_x = 0 - src_start_x;
+    
+    	int		src_start_y = sy - iMaskCenterY;
+    
+    	if (src_start_y < 0)
+    		mask_start_y = 0 - src_start_y;
+    
+    	int		src_end_x = src_start_x + iMaskWidth;
+    	int		src_end_y = src_start_y + iMaskHeight;
+    
+    	if (src_start_x < 0)
+    		src_start_x = 0;
+    
+    	if (src_start_y < 0)
+    		src_start_y = 0;
+    
+    	if (src_end_x > iWidth)
+    		src_end_x = iWidth;
+    
+    	if (src_end_y > iHeight)
+    		src_end_y = iHeight;
+    
+    	int		sample_width = src_end_x - src_start_x;
+    	int		sample_height = src_end_y - src_start_y;
+    
+    	__m128 total_color = _mm_setzero_ps();
+    
+    	for (int y = 0; y < sample_height; y++)
+    	{
+    		for (int x = 0; x < sample_width; x++)
+    		{
+    			int weight = pMask[(x + mask_start_x) + (y + mask_start_y) * iMaskWidth];
+    
+    			DWORD* pPixel = (DWORD*)(pBits + ((x + src_start_x) << 2) + (y + src_start_y) * iPitch);
+    
+    			__m128i dwPixelIn = _mm_set1_epi32(*pPixel);
+    
+    			// 각 채널을 추출하는 비트 마스크 (R, G, B, A 추출)
+    			__m128i mask = _mm_setr_epi32(0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000);
+    
+    			__m128i colors = _mm_and_si128(dwPixelIn, mask);
+    
+    			colors.m128i_u32[3] = colors.m128i_u32[3] >> 24;
+    			colors.m128i_u32[2] = colors.m128i_u32[2] >> 16;
+    			colors.m128i_u32[1] = colors.m128i_u32[1] >> 8;
+    			//colors.m128i_u32[0] = (int)(dwPixelIn & 0x000000ff);
+    			__m128 colorsFloat = _mm_cvtepi32_ps(colors);
+    			__m128 weightVec = _mm_set1_ps(weight);
+    
+    			colorsFloat = _mm_mul_ps(colorsFloat, weightVec);
+    
+    			total_color = _mm_add_ps(total_color, colorsFloat);
+    		}
+    	}
+    
+    	int bw = (int)(((float)total_color.m128_f32[2] * 0.3f) + ((float)total_color.m128_f32[1] * 0.59f) + ((float)total_color.m128_f32[0] * 0.11f));
+    
+    	bw = 255 - bw;
+    
+    	if (bw > 255) bw = 255;
+    	if (bw < 0) bw = 0;
+    
+    	return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+    }
+    
+    ```
+    
+    결과는 7프레임 → 8프레임 정도로 의미가 없었습니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/541bc289-2333-4e28-b3c8-e52aaf9c1fcf/image.png)
+    
+- 방법 2.
+    
+    다음은 비트마스킹 부분을 조금 수정 한 후 GrayScale 연산의 부분도 가충지를 __m128로 로드하여서 한번에 연산을 해보았습니다.
+    
+    ```cpp
+    DWORD SampleEdgePixel32_CPU_SIMD2(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+    {
+    	int		src_start_x = sx - iMaskCenterX;
+    	int		mask_start_x = 0;
+    	int		mask_start_y = 0;
+    
+    	if (src_start_x < 0)
+    		mask_start_x = 0 - src_start_x;
+    
+    	int		src_start_y = sy - iMaskCenterY;
+    
+    	if (src_start_y < 0)
+    		mask_start_y = 0 - src_start_y;
+    
+    	int		src_end_x = src_start_x + iMaskWidth;
+    	int		src_end_y = src_start_y + iMaskHeight;
+    
+    	if (src_start_x < 0)
+    		src_start_x = 0;
+    
+    	if (src_start_y < 0)
+    		src_start_y = 0;
+    
+    	if (src_end_x > iWidth)
+    		src_end_x = iWidth;
+    
+    	if (src_end_y > iHeight)
+    		src_end_y = iHeight;
+    
+    	int		sample_width = src_end_x - src_start_x;
+    	int		sample_height = src_end_y - src_start_y;
+    
+    	__m128 total_color = _mm_setzero_ps();
+    
+    	for (int y = 0; y < sample_height; y++)
+    	{
+    		for (int x = 0; x < sample_width; x++)
+    		{
+    			int weight = pMask[(x + mask_start_x) + (y + mask_start_y) * iMaskWidth];
+    
+    			DWORD* pPixel = (DWORD*)(pBits + ((x + src_start_x) << 2) + (y + src_start_y) * iPitch);
+    
+    			__m128i pixelData = _mm_loadu_si128((__m128i*) & *pPixel);
+    
+    			__m128i alpha = _mm_and_si128(_mm_srli_epi32(pixelData, 24), _mm_set1_epi32(0xFF));
+    			__m128i red = _mm_and_si128(_mm_srli_epi32(pixelData, 16), _mm_set1_epi32(0xFF));
+    			__m128i green = _mm_and_si128(_mm_srli_epi32(pixelData, 8), _mm_set1_epi32(0xFF));
+    			__m128i blue = _mm_and_si128(pixelData, _mm_set1_epi32(0xFF));
+    
+    			__m128 alphaF = _mm_cvtepi32_ps(alpha);
+    			__m128 redF = _mm_cvtepi32_ps(red);
+    			__m128 greenF = _mm_cvtepi32_ps(green);
+    			__m128 blueF = _mm_cvtepi32_ps(blue);
+    
+    			__m128 weightVec = _mm_set1_ps(weight);
+    
+    			alphaF = _mm_mul_ps(alphaF, weightVec);
+    			redF = _mm_mul_ps(redF, weightVec);
+    			greenF = _mm_mul_ps(greenF, weightVec);
+    			blueF = _mm_mul_ps(blueF, weightVec);
+    
+    			total_color = _mm_add_ps(total_color, alphaF);
+    			total_color = _mm_add_ps(total_color, redF);
+    			total_color = _mm_add_ps(total_color, greenF);
+    			total_color = _mm_add_ps(total_color, blueF);
+    		}
+    	}
+    
+    	__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);  // Blue, Green, Red, Alpha는 무시
+        __m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+        
+          __m128 sum = _mm_hadd_ps(weightedColor, weightedColor);  // 수평 덧셈
+        sum = _mm_hadd_ps(sum, sum);  // 최종 합산
+    
+        __m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+        invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+        int bw = (int)_mm_cvtss_f32(invGray);
+        return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+    
+    ```
+    
+    결과는 7프레임 → 24 프레임으로 유의미한 결과를 얻었습니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/129a78a0-032b-417f-9bc4-ec8093f70873/image.png)
+    
+- 방법 3.
+    
+    이번에는 CPU 최적화 기법 중에 CPU가 for문을 풀지 못한다는 소리를 듣고 주어진 과제 내에서 CPU에 친화적으로 코드를 최적화시켜 주었습니다.
+    
+    ```cpp
+    DWORD SampleEdgePixel32_CPU_SIMD3_1(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+    {
+    	int		src_start_x = sx - iMaskCenterX;
+    	int		mask_start_x = 0;
+    	int		mask_start_y = 0;
+    
+    	if (src_start_x < 0)
+    		mask_start_x = 0 - src_start_x;
+    
+    	int		src_start_y = sy - iMaskCenterY;
+    
+    	if (src_start_y < 0)
+    		mask_start_y = 0 - src_start_y;
+    
+    	int		src_end_x = src_start_x + iMaskWidth;
+    	int		src_end_y = src_start_y + iMaskHeight;
+    
+    	if (src_start_x < 0)
+    		src_start_x = 0;
+    
+    	if (src_start_y < 0)
+    		src_start_y = 0;
+    
+    	if (src_end_x > iWidth)
+    		src_end_x = iWidth;
+    
+    	if (src_end_y > iHeight)
+    		src_end_y = iHeight;
+    
+    	int		sample_width = src_end_x - src_start_x - 1;
+    	int		middle_x = sample_width / 2;
+    	int		sample_height = src_end_y - src_start_y - 1;
+    	int		middle_y = sample_height / 2;
+    
+    	__m128 total_color = _mm_setzero_ps();
+    
+    	DWORD* pPixel1 = (DWORD*)(pBits + ((src_start_x) << 2) + (src_start_y) * iPitch);
+    	DWORD* pPixel2 = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (src_start_y) * iPitch);
+    	DWORD* pPixel3 = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (src_start_y) * iPitch);
+    	DWORD* pPixel4 = (DWORD*)(pBits + ((src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	DWORD* pPixel5 = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	DWORD* pPixel6 = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	DWORD* pPixel7 = (DWORD*)(pBits + ((src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    	DWORD* pPixel8 = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    	DWORD* pPixel9 = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    
+    	int color[9][4];
+    
+    	color[0][3] = (int)((*pPixel1 & 0xff000000) >> 24);
+    	color[0][2] = (int)((*pPixel1 & 0x00ff0000) >> 16);
+    	color[0][1] = (int)((*pPixel1 & 0x0000ff00) >> 8);
+    	color[0][0] = (int)(*pPixel1 & 0x000000ff);
+    
+    	color[1][3] = (int)((*pPixel2 & 0xff000000) >> 24);
+    	color[1][2] = (int)((*pPixel2 & 0x00ff0000) >> 16);
+    	color[1][1] = (int)((*pPixel2 & 0x0000ff00) >> 8);
+    	color[1][0] = (int)(*pPixel2 & 0x000000ff);
+    
+    	color[2][3] = (int)((*pPixel3 & 0xff000000) >> 24);
+    	color[2][2] = (int)((*pPixel3 & 0x00ff0000) >> 16);
+    	color[2][1] = (int)((*pPixel3 & 0x0000ff00) >> 8);
+    	color[2][0] = (int)(*pPixel3 & 0x000000ff);
+    
+    	color[3][3] = (int)((*pPixel4 & 0xff000000) >> 24);
+    	color[3][2] = (int)((*pPixel4 & 0x00ff0000) >> 16);
+    	color[3][1] = (int)((*pPixel4 & 0x0000ff00) >> 8);
+    	color[3][0] = (int)(*pPixel4 & 0x000000ff);
+    
+    	color[4][3] = (int)((*pPixel5 & 0xff000000) >> 24);
+    	color[4][2] = (int)((*pPixel5 & 0x00ff0000) >> 16);
+    	color[4][1] = (int)((*pPixel5 & 0x0000ff00) >> 8);
+    	color[4][0] = (int)(*pPixel5 & 0x000000ff);
+    
+    	color[5][3] = (int)((*pPixel6 & 0xff000000) >> 24);
+    	color[5][2] = (int)((*pPixel6 & 0x00ff0000) >> 16);
+    	color[5][1] = (int)((*pPixel6 & 0x0000ff00) >> 8);
+    	color[5][0] = (int)(*pPixel6 & 0x000000ff);
+    
+    	color[6][3] = (int)((*pPixel7 & 0xff000000) >> 24);
+    	color[6][2] = (int)((*pPixel7 & 0x00ff0000) >> 16);
+    	color[6][1] = (int)((*pPixel7 & 0x0000ff00) >> 8);
+    	color[6][0] = (int)(*pPixel7 & 0x000000ff);
+    
+    	color[7][3] = (int)((*pPixel8 & 0xff000000) >> 24);
+    	color[7][2] = (int)((*pPixel8 & 0x00ff0000) >> 16);
+    	color[7][1] = (int)((*pPixel8 & 0x0000ff00) >> 8);
+    	color[7][0] = (int)(*pPixel8 & 0x000000ff);
+    
+    	color[8][3] = (int)((*pPixel9 & 0xff000000) >> 24);
+    	color[8][2] = (int)((*pPixel9 & 0x00ff0000) >> 16);
+    	color[8][1] = (int)((*pPixel9 & 0x0000ff00) >> 8);
+    	color[8][0] = (int)(*pPixel9 & 0x000000ff);
+    
+    	__m128 pixelData[9];
+    	
+    	pixelData[0] = _mm_set_ps(
+    		static_cast<float>(color[0][3]),
+    		static_cast<float>(color[0][2]),
+    		static_cast<float>(color[0][1]),
+    		static_cast<float>(color[0][0])
+    	);
+    	pixelData[1] = _mm_set_ps(
+    		static_cast<float>(color[1][3]),
+    		static_cast<float>(color[1][2]),
+    		static_cast<float>(color[1][1]),
+    		static_cast<float>(color[1][0])
+    	);
+    	pixelData[2] = _mm_set_ps(
+    		static_cast<float>(color[2][3]),
+    		static_cast<float>(color[2][2]),
+    		static_cast<float>(color[2][1]),
+    		static_cast<float>(color[2][0])
+    	);
+    	pixelData[3] = _mm_set_ps(
+    		static_cast<float>(color[3][3]),
+    		static_cast<float>(color[3][2]),
+    		static_cast<float>(color[3][1]),
+    		static_cast<float>(color[3][0])
+    	);
+    	pixelData[4] = _mm_set_ps(
+    		static_cast<float>(color[4][3]),
+    		static_cast<float>(color[4][2]),
+    		static_cast<float>(color[4][1]),
+    		static_cast<float>(color[4][0])
+    	);
+    	pixelData[5] = _mm_set_ps(
+    		static_cast<float>(color[5][3]),
+    		static_cast<float>(color[5][2]),
+    		static_cast<float>(color[5][1]),
+    		static_cast<float>(color[5][0])
+    	);
+    	pixelData[6] = _mm_set_ps(
+    		static_cast<float>(color[6][3]),
+    		static_cast<float>(color[6][2]),
+    		static_cast<float>(color[6][1]),
+    		static_cast<float>(color[6][0])
+    	);
+    	pixelData[7] = _mm_set_ps(
+    		static_cast<float>(color[7][3]),
+    		static_cast<float>(color[7][2]),
+    		static_cast<float>(color[7][1]),
+    		static_cast<float>(color[7][0])
+    	);
+    	pixelData[8] = _mm_set_ps(
+    		static_cast<float>(color[8][3]),
+    		static_cast<float>(color[8][2]),
+    		static_cast<float>(color[8][1]),
+    		static_cast<float>(color[8][0])
+    	);
+    
+    	total_color = _mm_add_ps(total_color, pixelData[0]);
+    	total_color = _mm_add_ps(total_color, pixelData[1]);
+    	total_color = _mm_add_ps(total_color, pixelData[2]);
+     
+    	total_color = _mm_add_ps(total_color, pixelData[3]);
+    	total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[4], _mm_set1_ps(-8)));
+    	total_color = _mm_add_ps(total_color, pixelData[5]);
+     
+    	total_color = _mm_add_ps(total_color, pixelData[6]);
+    	total_color = _mm_add_ps(total_color, pixelData[7]);
+    	total_color = _mm_add_ps(total_color, pixelData[8]);
+    
+    	__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);  // Blue, Green, Red, Alpha는 무시
+    
+    	// 각 채널에 가중치를 곱하고 합산
+    	__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+    
+    	// 가중치가 적용된 값들을 합산하여 그레이스케일 값을 계산 (하나의 값으로 합산)
+    	__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);  // 수평 덧셈
+    	sum = _mm_hadd_ps(sum, sum);  // 최종 합산
+    
+    	// 그레이스케일 값을 255에서 빼서 반전
+    	__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+    
+    	// 0~255로 클램핑
+    	invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+    
+    	// 결과를 정수로 변환
+    	int bw = (int)_mm_cvtss_f32(invGray);
+    
+    	// ARGB 포맷으로 변환하여 DWORD로 반환
+    	return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+    }
+    
+    ```
+    
+    결과는 24프레임 →32 프레임으로 유의미한 상승이 있었습니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/2ace763b-da43-4e85-8068-86b282fcd575/image.png)
+    
+
+- 이후 방법들은 기타 알고리즘을 최적화 기법들을 같이 사용 한 것들입니다.
+
+- 방법 4.
+    
+    오랫동안 진전이 없던 상황에 추가적으로 SIMD최적화로 여러 시도 끝에 color값을 한번에 SIMD연산으로 계산 해 주었습니다.
+    
+    ```cpp
+    
+    DWORD SampleEdgePixel32_CPU_SIMD3_2(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+    {
+    	int		src_start_x = sx - iMaskCenterX;
+    	int		mask_start_x = 0;
+    	int		mask_start_y = 0;
+    
+    	if (src_start_x < 0)
+    		mask_start_x = 0 - src_start_x;
+    
+    	int		src_start_y = sy - iMaskCenterY;
+    
+    	if (src_start_y < 0)
+    		mask_start_y = 0 - src_start_y;
+    
+    	int		src_end_x = src_start_x + iMaskWidth;
+    	int		src_end_y = src_start_y + iMaskHeight;
+    
+    	if (src_start_x < 0)
+    		src_start_x = 0;
+    
+    	if (src_start_y < 0)
+    		src_start_y = 0;
+    
+    	if (src_end_x > iWidth)
+    		src_end_x = iWidth;
+    
+    	if (src_end_y > iHeight)
+    		src_end_y = iHeight;
+    
+    	int		sample_width = src_end_x - src_start_x - 1;
+    	int		middle_x = sample_width / 2;
+    	int		sample_height = src_end_y - src_start_y - 1;
+    	int		middle_y = sample_height / 2;
+    
+    	__m128 total_color = _mm_setzero_ps();
+    
+    	DWORD* pPixel[9];
+    
+    	pPixel[0] = (DWORD*)(pBits + ((src_start_x) << 2) + (src_start_y)*iPitch);
+    	pPixel[1] = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (src_start_y)*iPitch);
+    	pPixel[2] = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (src_start_y)*iPitch);
+    	pPixel[3] = (DWORD*)(pBits + ((src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	pPixel[4] = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	pPixel[5] = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (middle_y + src_start_y) * iPitch);
+    	pPixel[6] = (DWORD*)(pBits + ((src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    	pPixel[7] = (DWORD*)(pBits + ((middle_x + src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    	pPixel[8] = (DWORD*)(pBits + ((sample_width + src_start_x) << 2) + (sample_height + src_start_y) * iPitch);
+    
+    	__m128i pixel[9];
+    	pixel[0] = _mm_cvtsi32_si128(*pPixel[0]);   // DWORD를 __m128i로 로드
+    	pixel[1] = _mm_cvtsi32_si128(*pPixel[1]);
+    	pixel[2] = _mm_cvtsi32_si128(*pPixel[2]);
+    	pixel[3] = _mm_cvtsi32_si128(*pPixel[3]);
+    	pixel[4] = _mm_cvtsi32_si128(*pPixel[4]);
+    	pixel[5] = _mm_cvtsi32_si128(*pPixel[5]);
+    	pixel[6] = _mm_cvtsi32_si128(*pPixel[6]);
+    	pixel[7] = _mm_cvtsi32_si128(*pPixel[7]);
+    	pixel[8] = _mm_cvtsi32_si128(*pPixel[8]);
+    
+    	__m128 pixelData[9];
+    	pixelData[0] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));   // 8비트 값을 32비트 정수로 확장하여 각 채널을 32비트로 분리
+    	pixelData[1] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+    	pixelData[2] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+    	pixelData[3] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[3]));
+    	pixelData[4] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[4]));
+    	pixelData[5] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[5]));
+    	pixelData[6] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[6]));
+    	pixelData[7] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[7]));
+    	pixelData[8] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[8]));
+    	
+    
+    	total_color = _mm_add_ps(total_color, pixelData[0]);
+    	total_color = _mm_add_ps(total_color, pixelData[1]);
+    	total_color = _mm_add_ps(total_color, pixelData[2]);
+    
+    	total_color = _mm_add_ps(total_color, pixelData[3]);
+    	total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[4], _mm_set1_ps(-8)));
+    	total_color = _mm_add_ps(total_color, pixelData[5]);
+    
+    	total_color = _mm_add_ps(total_color, pixelData[6]);
+    	total_color = _mm_add_ps(total_color, pixelData[7]);
+    	total_color = _mm_add_ps(total_color, pixelData[8]);
+    
+    	__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f); 
+    	__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+    
+    	__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);  // 수평 덧셈
+    	sum = _mm_hadd_ps(sum, sum);  // 최종 합산
+    
+    	__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+    
+    	invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+    
+    	int bw = (int)_mm_cvtss_f32(invGray);
+    	return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+    }
+    
+    ```
+    
+    결과는 24프레임 → 66~68 프레임으로 매우 유의미한 상승이 있었습니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/faf74c1a-8d08-47ce-b32a-54a71b6a7475/image.png)
+    
+- 방법 5.
+    
+    방법 3으로 넘어가기전에 여러 가지 방법을 시도했습니다. 그 중에서 가장 성능이 좋았던 것은 위 코드에서 가장 많이 연산되는 color값(기준 픽셀 기준으로 연산하고 이전 픽셀, 다음 픽셀 상,하 대각선 픽셀까지 총 최대 9번이 같은 값에 대해 연산이 됨)을 따로 저장해 두고 처음 한번만 연산 후 데이터를 가져오는 방식을 사용 하면 메모리는 늘어나겠지만 연산이 매우 줄어들고 접근을 통해 가져오면 된다는 생각으로 이미지랑 같은 크기의 __m128짜리 배열을 만들어 주고 이에 매 프래임마다 미리 계산을 해주었습니다.
+    
+    옆의 그림의 빨간색 픽셀에 해당되는 픽셀은 나머지 파란색 픽셀을 연산할 시 연산되고 또한 빨간색 자신의 픽셀을 연산시에도 색에 대한 연산이 들어갑니다.
+    
+    모든 픽셀이 이와 같은 방식으로 연산됩니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/e7bedc14-0d25-4b12-a8f6-c05698ea83b3/image.png)
+    
+    ```cpp
+    void CPU_Edge_Filter2(char* pDest, DWORD dwDestPitch, const char* pSrc, DWORD dwImageWidth, DWORD dwImageHeight, DWORD dwSrcPitch)
+    {
+    	DWORD	start_y = 0;
+    	DWORD	end_y = start_y + dwImageHeight;
+    	if (nullptr == map)
+    	{
+    		map = (__m128*)malloc(sizeof(__m128) * ((end_y + 2) * (dwSrcPitch + 2)));
+    		for (DWORD y = start_y; y < end_y; y++)
+    		{
+    			for (DWORD x = 0; x < dwImageWidth; x++)
+    			{
+    				if(y == 0 || x == 0 || y == end_y || x == dwImageWidth)
+    					map[y * dwSrcPitch + x] = _mm_set_ps(
+    						0,0,0,0
+    					);
+    			}
+    		}
+    	}
+    
+    	int color[4];
+    
+    //미리 연산 후 저장
+    	for (DWORD y = start_y; y < end_y; y++)
+    	{
+    		for (DWORD x = 0 ; x < dwImageWidth; x++)
+    		{
+    			DWORD* pPixel = (DWORD*)(pSrc + (x * 4) + (y * dwSrcPitch));
+    			
+    			//DWORD dwPixelIn = *pPixel;
+    
+    			//color[3] = (int)((dwPixelIn & 0xff000000) >> 24);
+    			//color[2] = (int)((dwPixelIn & 0x00ff0000) >> 16);
+    			//color[1] = (int)((dwPixelIn & 0x0000ff00) >> 8);
+    			//color[0] = (int)(dwPixelIn & 0x000000ff);
+    
+    			//map[(y + 1) * dwSrcPitch + x + 1] = _mm_set_ps(
+    			//	static_cast<float>(color[3]),
+    			//	static_cast<float>(color[2]),
+    			//	static_cast<float>(color[1]),
+    			//	static_cast<float>(color[0])
+    			//);		}
+    			
+    			// 위 코드를 SIMD로 한번에 저장하는 방식으로 추가함
+    			
+    			__m128i pixel = _mm_cvtsi32_si128(*pPixel);   // DWORD를 __m128i로 로드
+    			map[(y + 1) * dwSrcPitch + x + 1] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel));   // 8비트 값을 32비트 정수로 확장하여 각 채널을 32비트로 분리
+    	}
+    
+    // 기본 코드
+    	for (DWORD y = start_y; y < end_y; y++)
+    	{
+    		for (DWORD x = 0; x < dwImageWidth; x++)
+    		{
+    			DWORD	dwPixel = SampleEdgePixel32_CPU_SIMD6(pSrc, dwImageWidth, dwImageHeight, dwSrcPitch, x, y, SAMPLE_MASK_3_3_LAPLACIAN, MASK_3_3_WIDTH, MASK_3_3_HEIGHT, MASK_3_3_CENTER_X, MASK_3_3_CENTER_Y);
+    			DWORD* pDestColor = (DWORD*)(pDest + (x * 4) + (y * dwDestPitch));
+    			*pDestColor = dwPixel;
+    		}
+    	}
+    }
+    
+    DWORD SampleEdgePixel32_CPU_SIMD6(const char* pBits, int iWidth, int iHeight, int iPitch, int sx, int sy, int* pMask, int iMaskWidth, int iMaskHeight, int iMaskCenterX, int iMaskCenterY)
+    {
+    	int		src_start_x = sx - iMaskCenterX;
+    	int		mask_start_x = 0;
+    	int		mask_start_y = 0;
+    
+    	if (src_start_x < 0)
+    		mask_start_x = 0 - src_start_x;
+    
+    	int		src_start_y = sy - iMaskCenterY;
+    
+    	if (src_start_y < 0)
+    		mask_start_y = 0 - src_start_y;
+    
+    	int		src_end_x = src_start_x + iMaskWidth;
+    	int		src_end_y = src_start_y + iMaskHeight;
+    
+    	if (src_start_x < 0)
+    		src_start_x = 0;
+    
+    	if (src_start_y < 0)
+    		src_start_y = 0;
+    
+    	if (src_end_x > iWidth)
+    		src_end_x = iWidth;
+    
+    	if (src_end_y > iHeight)
+    		src_end_y = iHeight;
+    
+    	__m128 total_color = _mm_setzero_ps();
+    
+    	total_color = _mm_add_ps(total_color, map[(1 + src_start_y)*iPitch + (1 + src_start_x)]);
+    	total_color = _mm_add_ps(total_color, map[(1 + src_start_y)*iPitch + (1 + 1 + src_start_x)]);
+    	total_color = _mm_add_ps(total_color, map[(1 + src_start_y)*iPitch + (2 + 1 + src_start_x)]);
+    
+    	total_color = _mm_add_ps(total_color, map[(1 + 1 + src_start_y) * iPitch + (1 + src_start_x)]);
+    	total_color = _mm_add_ps(total_color, _mm_mul_ps(map[(1 + 1 + src_start_y) * iPitch + (1 + 1 + src_start_x)], _mm_set1_ps(-8)));
+    	total_color = _mm_add_ps(total_color, map[(1 + 1 + src_start_y) * iPitch + (2 + 1 + src_start_x)]);
+    
+    	total_color = _mm_add_ps(total_color, map[(2 + 1 + src_start_y) * iPitch + (1 + src_start_x)]);
+    	total_color = _mm_add_ps(total_color, map[(2 + 1 + src_start_y) * iPitch + (1 + 1 + src_start_x)]);
+    	total_color = _mm_add_ps(total_color, map[(2 + 1 + src_start_y) * iPitch + (2 + 1 + src_start_x)]);
+    
+    	__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);  // Blue, Green, Red, Alpha는 무시
+    	__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+    	__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);  // 수평 덧셈
+    	sum = _mm_hadd_ps(sum, sum);  // 최종 합산
+    	__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+    	invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+    	int bw = (int)_mm_cvtss_f32(invGray);
+    	return ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+    }
+    ```
+    
+    결과는 66프레임 → 76 프레임으로 더 이상 오래 동안 오르지 않던 프레임을 올렸습니다.
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/2d6c606a-6cf8-40a5-a1f8-097fcccb519c/image.png)
+    
+    하지만 문제가 있었습니다.
+    
+    멀티 쓰래드 환경에서는 기대 만큼의 성능이 나오지 않았습니다.
+    
+    방법 4와 멀티스레드를 적용시킨 결과 프레임이 360
+    방법 5와 멀티스레드를 적용시킨 결과 프레임이 250
+    
+    방법 4 + 멀티 스레드
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/4374b56a-b8bf-4c97-b99c-f62f4802ed36/image.png)
+    
+    방법 5 + 멀티 스레드
+    
+    ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/6c397338-11be-408c-944d-bdf37005bfbb/image.png)
+    
+    정도로 나왔습니다.  쓰레드 CPU최적화 등 여러가지 시도를 해봤지만 성능은 비슷하게 나왔습니다.
+    
+    이에 관해 무슨 이유인지 찾아보고 질문한 결과 대부분의 교수님들이 캐쉬문제라고 하였습니다.
+    
+    방법 5.가 싱글 쓰레드일때는 캐쉬히트율이 매우 높아서 괜찮지만 멀티쓰래드일 경우 데이터의 양이 커서 캐쉬히트율이 떨어지고 속도가 기대값만큼 안나오는 것 같다는 결론이 나왔습니다.
+    
+    이에 관해 교수님께 여쭈어본 결과
+    
+    DWORD(4Byte)데이터를 __m128(16Byte)로 4배 커지면서 캐쉬 히트율이 많이 저하될 것이라고 말씀해주셨습니다.
+    
+    따라서 방법이 데이터 자체가 본래 엄청 큰 데이터이여서 히트율이 본래 떨어질 경우 어느 정도 효과적일 수 있지만 지금의 경우에는 아니라고 판단했습니다.
+    
+- 번외.
+    1. __m128이 아닌 256, 512를 사용 할 수 있지 않을까?
+        
+        위 질문에 대한 답은 256은 가능하고 512는 CPU자원상 안된다 입니다. 
+        
+        또한 256도 시도 해본 결과 256방식도 모든 기능이 제공되는 것이 아니고 제공되는 방법으로 사용 할시 pack, unpack비용이 커서 효과가 없었습니다.
+        
+
+# 기타 알고리즘을 통한 성능 향상
+
+1. 중복된 연산을 제거 하기 위한 Data Map 생성
+    
+    위 SIMD의 방법 5의 방식입니다.
+    
+2. Loop Unrolling
+    
+    위 SIMD의 방법 3의 방식입니다.
+    
+3. 함수 콜 제거
+    - 
+        
+        SIMD와 멀티 쓰레드를 적용 시킨 후 함수 자체의 콜 비용도 모든 픽셀을 연산할 때 들어감으로 함수 자체를 직접 풀어서 중복되는 범위 연산을 줄이고 CPU가 최적화 할 수 있도록 코드를 짜면 어떨까 하는 생각으로부터 시작되었습니다.
+        
+        ```cpp
+        UINT WorkingThread3(LPVOID pArg)
+        {
+        	THREAD_CONTEXT* pThreadArg = (THREAD_CONTEXT*)pArg;
+        	const HANDLE* phEventList = pThreadArg->hEventList;
+        	while (1)
+        	{
+        		DWORD	dwEventIndex = WaitForMultipleObjects(THREAD_EVENT_COUNT, phEventList, FALSE, INFINITE);
+        		switch (dwEventIndex)
+        		{
+        		case THREAD_EVENT_WAKEUP:
+        			for (DWORD y = pThreadArg->argList.start_y; y < pThreadArg->argList.end_y; y++)
+        			{
+        				for (DWORD x = 0; x < pThreadArg->argList.dwImageWidth; x++)
+        				{
+        					int		src_start_x = x - MASK_3_3_CENTER_X;
+        					int		mask_start_x = 0;
+        					int		mask_start_y = 0;
+        
+        					if (src_start_x < 0)
+        						mask_start_x = 0 - src_start_x;
+        
+        					int		src_start_y = y - MASK_3_3_CENTER_Y;
+        
+        					if (src_start_y < 0)
+        						mask_start_y = 0 - src_start_y;
+        
+        					int		src_end_x = src_start_x + MASK_3_3_WIDTH;
+        					int		src_end_y = src_start_y + MASK_3_3_HEIGHT;
+        
+        					if (src_start_x < 0)
+        						src_start_x = 0;
+        
+        					if (src_start_y < 0)
+        						src_start_y = 0;
+        
+        					if (src_end_x > pThreadArg->argList.dwImageWidth)
+        						src_end_x = pThreadArg->argList.dwImageWidth;
+        
+        					if (src_end_y > pThreadArg->argList.dwImageHeight)
+        						src_end_y = pThreadArg->argList.dwImageHeight;
+        
+        					int		sample_width = src_end_x - src_start_x - 1;
+        					int		middle_x = sample_width / 2;
+        					int		sample_height = src_end_y - src_start_y - 1;
+        					int		middle_y = sample_height / 2;
+        
+        					__m128 total_color = _mm_setzero_ps();
+        
+        					DWORD* pPixel[9];
+        
+        					pPixel[0] = (DWORD*)(pThreadArg->argList.pSrc + ((src_start_x) << 2) + (src_start_y)*pThreadArg->argList.dwSrcPitch);
+        					pPixel[1] = (DWORD*)(pThreadArg->argList.pSrc + ((middle_x + src_start_x) << 2) + (src_start_y)*pThreadArg->argList.dwSrcPitch);
+        					pPixel[2] = (DWORD*)(pThreadArg->argList.pSrc + ((sample_width + src_start_x) << 2) + (src_start_y)*pThreadArg->argList.dwSrcPitch);
+        					pPixel[3] = (DWORD*)(pThreadArg->argList.pSrc + ((src_start_x) << 2) + (middle_y + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        					pPixel[4] = (DWORD*)(pThreadArg->argList.pSrc + ((middle_x + src_start_x) << 2) + (middle_y + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        					pPixel[5] = (DWORD*)(pThreadArg->argList.pSrc + ((sample_width + src_start_x) << 2) + (middle_y + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        					pPixel[6] = (DWORD*)(pThreadArg->argList.pSrc + ((src_start_x) << 2) + (sample_height + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        					pPixel[7] = (DWORD*)(pThreadArg->argList.pSrc + ((middle_x + src_start_x) << 2) + (sample_height + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        					pPixel[8] = (DWORD*)(pThreadArg->argList.pSrc + ((sample_width + src_start_x) << 2) + (sample_height + src_start_y) * pThreadArg->argList.dwSrcPitch);
+        
+        					__m128i pixel[9];
+        					pixel[0] = _mm_cvtsi32_si128(*pPixel[0]);   // DWORD를 __m128i로 로드
+        					pixel[1] = _mm_cvtsi32_si128(*pPixel[1]);
+        					pixel[2] = _mm_cvtsi32_si128(*pPixel[2]);
+        					pixel[3] = _mm_cvtsi32_si128(*pPixel[3]);
+        					pixel[4] = _mm_cvtsi32_si128(*pPixel[4]);
+        					pixel[5] = _mm_cvtsi32_si128(*pPixel[5]);
+        					pixel[6] = _mm_cvtsi32_si128(*pPixel[6]);
+        					pixel[7] = _mm_cvtsi32_si128(*pPixel[7]);
+        					pixel[8] = _mm_cvtsi32_si128(*pPixel[8]);
+        
+        					__m128 pixelData[9];
+        					pixelData[0] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));   // 8비트 값을 32비트 정수로 확장하여 각 채널을 32비트로 분리
+        					pixelData[1] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        					pixelData[2] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        					pixelData[3] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[3]));
+        					pixelData[4] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[4]));
+        					pixelData[5] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[5]));
+        					pixelData[6] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[6]));
+        					pixelData[7] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[7]));
+        					pixelData[8] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[8]));
+        
+        					total_color = _mm_add_ps(total_color, pixelData[0]);
+        					total_color = _mm_add_ps(total_color, pixelData[1]);
+        					total_color = _mm_add_ps(total_color, pixelData[2]);
+        
+        					total_color = _mm_add_ps(total_color, pixelData[3]);
+        					total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[4], _mm_set1_ps(-8)));
+        					total_color = _mm_add_ps(total_color, pixelData[5]);
+        
+        					total_color = _mm_add_ps(total_color, pixelData[6]);
+        					total_color = _mm_add_ps(total_color, pixelData[7]);
+        					total_color = _mm_add_ps(total_color, pixelData[8]);
+        
+        					__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);  // Blue, Green, Red, Alpha는 무시
+        
+        					// 각 채널에 가중치를 곱하고 합산
+        					__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+        
+        					// 가중치가 적용된 값들을 합산하여 그레이스케일 값을 계산 (하나의 값으로 합산)
+        					__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);  // 수평 덧셈
+        					sum = _mm_hadd_ps(sum, sum);  // 최종 합산
+        
+        					// 그레이스케일 값을 255에서 빼서 반전
+        					__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+        
+        					// 0~255로 클램핑
+        					invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+        
+        					// 결과를 정수로 변환
+        					int bw = _mm_cvtss_i32(invGray);
+        
+        					// ARGB 포맷으로 변환하여 DWORD로 반환
+        					DWORD	dwPixel = ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+        					DWORD* pDestColor = (DWORD*)(pThreadArg->argList.pDest + (x * 4) + (y * pThreadArg->argList.dwDestPitch));
+        					*pDestColor = dwPixel;
+        				}
+        			}
+        			SetEvent(pThreadArg->finishEvent);
+        			break;
+        		case THREAD_EVENT_DESTROY:
+        			goto lb_exit;
+        		}
+        	}
+        
+        lb_exit:
+        	_endthreadex(0);
+        	return 0;
+        }
+        ```
+        
+        따라서 위와 같이 쓰레드함수 자체에서 함수를 부르지 않고 연산해본 결과
+        
+        360 프레임 → 390 ~ 400 프레임을 달성하였습니다!
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/e4c73d81-828c-41c5-800c-4d771ca702a1/image.png)
+        
+4. Rolling 기법
+    - 
+        
+        다음은 인덱스 롤링을 통해 중복되는 연산을 안할 수 있는 방법을 생각해보았습니다.
+        
+        방법은 다음과 같습니다.
+        
+        위에서 말슴드렸듯 한 픽셀에 대해 연산을 할때 중복되는 부분이 생깁니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/665f503b-b9c3-407d-a413-95c8b8b7df5e/image.png)
+        
+        이런 중복 계산이 되는 부분들을 위 그림에서 빨간색 테두리가 9개의 배열이라고 하면
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/4671decc-7659-4a72-bfef-1c79e7c5d3f7/image.png)
+        
+        위와 같은 그림을 연산을 할때
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/7695c4fb-5de6-469c-ae2f-973a812f001f/image.png)
+        
+        4, 104, 204부분만 1, 101, 201 부분에 덮어쓰고 밀면서 인덱싱을 해줌으로써 중복되는 값에 대한 연산을 줄였습니다.
+        
+        또한 최적화된 어셈블리어와, 성능 프로파일링을 통해 필요 없는 값에 대한 연산과 Src부분 연산에서의 최적화도 하였습니다.
+        
+        ```cpp
+        UINT WorkingThread4(LPVOID pArg)
+        {
+        	THREAD_CONTEXT* pThreadArg = (THREAD_CONTEXT*)pArg;
+        	const HANDLE* phEventList = pThreadArg->hEventList;
+        	DWORD* pPixel[9];
+        	__m128i pixel[9];
+        	__m128 pixelData[9];
+        	int rollinIndex;
+        	const char* start_src;
+        
+        	while (1)
+        	{
+        		DWORD	dwEventIndex = WaitForMultipleObjects(THREAD_EVENT_COUNT, phEventList, FALSE, INFINITE);
+        		switch (dwEventIndex)
+        		{
+        		case THREAD_EVENT_WAKEUP:
+        			start_src = pThreadArg->argList.pSrc;
+        			if (pThreadArg->argList.start_y == 0)
+        				pThreadArg->argList.start_y++;
+        			if (pThreadArg->argList.end_y == pThreadArg->argList.dwImageHeight)
+        				pThreadArg->argList.end_y-= 2;
+        			for (DWORD y = pThreadArg->argList.start_y; y < pThreadArg->argList.end_y; y++)
+        			{
+        				DWORD* line_1 = (DWORD*)(start_src + ((y - 1) * pThreadArg->argList.dwSrcPitch));
+        				DWORD* line_2 = (DWORD*)(start_src + ((y) * pThreadArg->argList.dwSrcPitch));
+        				DWORD* line_3 = (DWORD*)(start_src + ((y + 1) * pThreadArg->argList.dwSrcPitch));
+        
+        				//롤링을 위한 처음 값의 연산
+        				pPixel[0] = line_1;
+        				pPixel[1] = line_2;
+        				pPixel[2] = line_3;
+        
+        				pPixel[3] = ++line_1;
+        				pPixel[4] = ++line_2;
+        				pPixel[5] = ++line_3;
+        
+        				pPixel[6] = ++line_1;
+        				pPixel[7] = ++line_2;
+        				pPixel[8] = ++line_3;
+        
+        				pixel[0] = _mm_cvtsi32_si128(*pPixel[0]);
+        				pixel[1] = _mm_cvtsi32_si128(*pPixel[1]);
+        				pixel[2] = _mm_cvtsi32_si128(*pPixel[2]);
+        
+        				pixel[3] = _mm_cvtsi32_si128(*pPixel[3]);
+        				pixel[4] = _mm_cvtsi32_si128(*pPixel[4]);
+        				pixel[5] = _mm_cvtsi32_si128(*pPixel[5]);
+        
+        				pixel[6] = _mm_cvtsi32_si128(*pPixel[6]);
+        				pixel[7] = _mm_cvtsi32_si128(*pPixel[7]);
+        				pixel[8] = _mm_cvtsi32_si128(*pPixel[8]);
+        
+        				pixelData[0] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));
+        				pixelData[1] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        				pixelData[2] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        
+        				pixelData[3] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[3]));
+        				pixelData[4] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[4]));
+        				pixelData[5] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[5]));
+        				
+        				pixelData[6] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[6]));
+        				pixelData[7] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[7]));
+        				pixelData[8] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[8]));
+        
+        				__m128 total_color = _mm_setzero_ps();
+        				total_color = _mm_add_ps(total_color, pixelData[0]);
+        				total_color = _mm_add_ps(total_color, pixelData[1]);
+        				total_color = _mm_add_ps(total_color, pixelData[2]);
+        				total_color = _mm_add_ps(total_color, pixelData[3]);
+        				total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[4], _mm_set1_ps(-8)));
+        				total_color = _mm_add_ps(total_color, pixelData[5]);
+        				total_color = _mm_add_ps(total_color, pixelData[6]);
+        				total_color = _mm_add_ps(total_color, pixelData[7]);
+        				total_color = _mm_add_ps(total_color, pixelData[8]);
+        
+        				__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);
+        				__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+        				__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);
+        				sum = _mm_hadd_ps(sum, sum);
+        				__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+        				invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+        				int bw = _mm_cvtss_i32(invGray);
+        
+        				DWORD	dwPixel = ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+        
+        				DWORD* pDestColor = (DWORD*)(pThreadArg->argList.pDest + ((y)*pThreadArg->argList.dwDestPitch));
+        				*pDestColor = dwPixel;
+        
+        				// 주요 코드
+        				rollinIndex = 6;
+        				for (DWORD x = 2; x < pThreadArg->argList.dwImageWidth; x++)
+        				{
+        					total_color = _mm_setzero_ps();
+        
+        					int rollinIndex2 = rollinIndex + 1;
+        					int rollinIndex3 = rollinIndex + 2;
+        
+        					pPixel[rollinIndex]		=  ++line_1;
+        					pPixel[rollinIndex2]	=  ++line_2;
+        					pPixel[rollinIndex3]	=  ++line_3;
+        
+        					pixel[rollinIndex]	= _mm_cvtsi32_si128(*pPixel[rollinIndex]);
+        					pixel[rollinIndex2] = _mm_cvtsi32_si128(*pPixel[rollinIndex2]);
+        					pixel[rollinIndex3] = _mm_cvtsi32_si128(*pPixel[rollinIndex3]);
+        
+        					pixelData[rollinIndex] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[rollinIndex]));
+        					pixelData[rollinIndex2] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[rollinIndex2]));
+        					pixelData[rollinIndex3] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[rollinIndex3]));
+        
+        					total_color = _mm_add_ps(total_color, pixelData[0]);
+        					total_color = _mm_add_ps(total_color, pixelData[1]);
+        					total_color = _mm_add_ps(total_color, pixelData[2]);
+        					total_color = _mm_add_ps(total_color, pixelData[3]);
+        					total_color = _mm_add_ps(total_color, pixelData[4]);
+        					total_color = _mm_add_ps(total_color, pixelData[5]);
+        					total_color = _mm_add_ps(total_color, pixelData[6]);
+        					total_color = _mm_add_ps(total_color, pixelData[7]);
+        					total_color = _mm_add_ps(total_color, pixelData[8]);
+        					
+        					rollinIndex = (rollinIndex + 6) % 9;
+        					total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[rollinIndex], _mm_set1_ps(-9)));
+        					rollinIndex = (rollinIndex + 6) % 9;
+        
+        					__m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);
+        					__m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+        					__m128 sum = _mm_hadd_ps(weightedColor, weightedColor);
+        					sum = _mm_hadd_ps(sum, sum);
+        					__m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+        					invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+        					int bw = _mm_cvtss_i32(invGray);
+        					
+        					DWORD	dwPixel = ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+        
+        					DWORD* pDestColor = (DWORD*)(pThreadArg->argList.pDest + (x * 4) + ((y) * pThreadArg->argList.dwDestPitch));
+        					*pDestColor = dwPixel;
+        				}
+        			}
+        			SetEvent(pThreadArg->finishEvent);
+        			break;
+        		case THREAD_EVENT_DESTROY:
+        			goto lb_exit;
+        		}
+        	}
+        
+        lb_exit:
+        	_endthreadex(0);
+        	return 0;
+        }
+        ```
+        
+        위의 주요 코드의 부분처럼 인덱스를 사용하여 하나 씩 옆으로 밀면서 연산을 하였습니다.
+        
+        위 결과 400 프레임 → 430 프레임까지 올렸습니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/4926734f-8f21-4b3e-9243-074b9d87827c/image.png)
+        
+        하지만 어셈블리어와 성능 프로파일러의 확인 결과 모듈 연산과 그에 대한 결과의 인덱스로 쓰는 연산에서 많은 성능 저하를 발견했습니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/5c7e9d13-a51c-4753-b39a-b82486f0d5b4/image.png)
+        
+        또한 dest의 좌표를 연산하는 부분에서도 매우 큰 과부하가 있어서 좀 더 최적화를 시켰습니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/2838101d-e856-48c9-b743-98c56a1556b1/image.png)
+        
+        이에 따라 dest부분을 연산 하는 부분 없애고 좀 더 최적화 시키고, index를 모듈 연산  앞으로 당겨서 복제하는 연산으로 바꾸었더니
+        
+        ```cpp
+        UINT WorkingThread5(LPVOID pArg)
+        {
+        	THREAD_CONTEXT* pThreadArg = (THREAD_CONTEXT*)pArg;
+        	const HANDLE* phEventList = pThreadArg->hEventList;
+        	__m128i pixel[3];
+        	__m128 pixelData[9];
+        	const char* start_src;
+        	__m128 total_color;
+        
+        	while (1)
+        	{
+        		DWORD	dwEventIndex = WaitForMultipleObjects(THREAD_EVENT_COUNT, phEventList, FALSE, INFINITE);
+        		switch (dwEventIndex)
+        		{
+        		case THREAD_EVENT_WAKEUP:
+        			start_src = pThreadArg->argList.pSrc;
+        			if (pThreadArg->argList.start_y == 0)
+        				pThreadArg->argList.start_y++;
+        			if (pThreadArg->argList.end_y == pThreadArg->argList.dwImageHeight)
+        				pThreadArg->argList.end_y--;
+        			for (DWORD y = pThreadArg->argList.start_y; y < pThreadArg->argList.end_y; y++)
+        			{
+        				DWORD* line_1 = (DWORD*)(start_src + ((y - 1) * pThreadArg->argList.dwSrcPitch));
+        				DWORD* line_2 = (DWORD*)(start_src + ((y)*pThreadArg->argList.dwSrcPitch));
+        				DWORD* line_3 = (DWORD*)(start_src + ((y + 1) * pThreadArg->argList.dwSrcPitch));
+        				DWORD* line_Dest = (DWORD*)(pThreadArg->argList.pDest + 8 + ((y)*pThreadArg->argList.dwDestPitch));
+        
+        				pixel[0] = _mm_cvtsi32_si128(*(line_1++));
+        				pixel[1] = _mm_cvtsi32_si128(*(line_2++));
+        				pixel[2] = _mm_cvtsi32_si128(*(line_3++));
+        
+        				pixelData[0] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));
+        				pixelData[1] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        				pixelData[2] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        
+        				pixel[0] = _mm_cvtsi32_si128(*(line_1++));
+        				pixel[1] = _mm_cvtsi32_si128(*(line_2++));
+        				pixel[2] = _mm_cvtsi32_si128(*(line_3++));
+        
+        				pixelData[3] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));
+        				pixelData[4] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        				pixelData[5] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        
+        				pixel[0] = _mm_cvtsi32_si128(*(line_1++));
+        				pixel[1] = _mm_cvtsi32_si128(*(line_2++));
+        				pixel[2] = _mm_cvtsi32_si128(*(line_3++));
+        
+        				pixelData[6] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));
+        				pixelData[7] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        				pixelData[8] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        
+        				for (DWORD x = 1; x < pThreadArg->argList.dwImageWidth; x++)
+        				{
+        					total_color = _mm_setzero_ps();
+        
+        					 pixel[0] = _mm_cvtsi32_si128(*(line_1++));
+        					 pixel[1] = _mm_cvtsi32_si128(*(line_2++));
+        					 pixel[2] = _mm_cvtsi32_si128(*(line_3++));
+        					 
+        					 pixelData[0] = pixelData[3];
+        					 pixelData[1] = pixelData[4];
+        					 pixelData[2] = pixelData[5];
+        					 pixelData[3] = pixelData[6];
+        					 pixelData[4] = pixelData[7];
+        					 pixelData[5] = pixelData[8];
+        					 
+        					 pixelData[6] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[0]));
+        					 pixelData[7] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[1]));
+        					 pixelData[8] = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(pixel[2]));
+        					 
+        					 total_color = _mm_add_ps(total_color, pixelData[0]);
+        					 total_color = _mm_add_ps(total_color, pixelData[1]);
+        					 total_color = _mm_add_ps(total_color, pixelData[2]);
+        					 total_color = _mm_add_ps(total_color, pixelData[3]);
+        					 total_color = _mm_add_ps(total_color, _mm_mul_ps(pixelData[4], _mm_set1_ps(-8)));
+        					 total_color = _mm_add_ps(total_color, pixelData[5]);
+        					 total_color = _mm_add_ps(total_color, pixelData[6]);
+        					 total_color = _mm_add_ps(total_color, pixelData[7]);
+        					 total_color = _mm_add_ps(total_color, pixelData[8]);
+        					 
+        					 __m128 grayscaleWeights = _mm_setr_ps(0.11f, 0.59f, 0.3f, 0.0f);
+        					 __m128 weightedColor = _mm_mul_ps(total_color, grayscaleWeights);
+        					 __m128 sum = _mm_hadd_ps(weightedColor, weightedColor);
+        					 sum = _mm_hadd_ps(sum, sum);
+        					 __m128 invGray = _mm_sub_ps(_mm_set1_ps(255.0f), sum);
+        					 invGray = _mm_max_ps(_mm_min_ps(invGray, _mm_set1_ps(255.0f)), _mm_set1_ps(0.0f));
+        					 int bw = _mm_cvtss_i32(invGray);
+        
+        					 DWORD	dwPixel = ((bw << 24) | (bw << 16) | (bw << 8) | bw);
+        					 
+        					 *line_Dest++ = dwPixel;
+        				}
+        			}
+        			SetEvent(pThreadArg->finishEvent);
+        			break;
+        		case THREAD_EVENT_DESTROY:
+        			goto lb_exit;
+        		}
+        	}
+        
+        lb_exit:
+        
+        	ThreadPool::GetInstance()->usingThread[pThreadArg->argList.num] = false;
+        	ThreadPool::GetInstance()->threadList[pThreadArg->argList.num] = nullptr;
+        	_endthreadex(0);
+        	return 0;
+        }
+        ```
+        
+        Dest 연산의 비율이 65% → 24% 로 줄일 수 있었고
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/ba7abbca-a0cf-42b7-ab72-0df6e9e967c2/image.png)
+        
+        프레임은 480 ~ 510 정도를 왔다 갔다 하게 되었습니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/425c5974-9bd0-4b8a-b9b0-770ecbee59e7/image.png)
+        
+5. 최적 쓰레드 수 연산
+    - 
+        
+        마지막으로 쓰레드의 숫자에 따라 속도가 달리지길래 쓰레드의 수 공식을 찾아본 결과
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/315dec07-aa6f-4775-b734-faaabdd11183/image.png)
+        
+        다음과 같은 공식을 찾았습니다.
+        
+        - +) 참고 자료
+            
+            추가적인 계산 방식들
+            
+            ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/82e0d6f4-ad1d-4ad3-a5b5-acbe05f6ea4f/image.png)
+            
+            ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/ee9a6509-cdef-4634-8f6e-f14190e92c14/image.png)
+            
+            ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/c4a655b0-7657-4fd2-a6be-998037419738/image.png)
+            
+        
+        저의 컴퓨터 에서 코어 갯수는 32 개이지만 64개를 했을때 더 빨라지는 현상을 확인했습니다.  하지만 제가 생각하기에는  저희 작업은 CPU 바운드 작업에 속한다고 생각을 하여서 작업량에 대한 차이라고 생각이 들었습니다.
+        
+        이에 따라 32개부터 128개까지의 모든 경우를 N번(아래의 코드에서는 1000번으로 실행했습니다) 반복을 통해 최적의 갯수를 찾고 그것을 기반으로 고정시켜서 최적 쓰레드 수를 구했습니다.
+        
+        ```cpp
+        // Working Thread의 일부분
+        ULONGLONG startClock = GetTickCount64();
+        for (DWORD i = 0; i < WorkingThreadCount; i++)
+        {
+        	SetEvent(instance->threadEventHandle[i].hEventList[THREAD_EVENT_WAKEUP]);
+        }
+        
+        WaitForMultipleObjects(WorkingThreadCount, instance->completeEventList, TRUE, INFINITE);
+        ULONGLONG endClock = GetTickCount64();
+        ThreadPool::GetInstance()->AdjustmentThreadCount(endClock - startClock);
+        
+        // ThreadPool의 일부분
+        void ThreadPool::AdjustmentThreadCount(ULONGLONG fps)
+        {
+        	if (FinishAdjustment)
+        		return;
+        	DuringTimeIndex[curThreadCount - 1] += fps;
+        
+        	AdjustmentCount++;
+        	if (AdjustmentCount < AdjustmentTime)
+        		return;
+        
+        	AdjustmentCount = 0;
+        	curThreadCount++;
+        	isFirst = false;
+        	if (curThreadCount > MAX_THREAD_COUNT)
+        	{
+        		int minTimeIndex = CheckCurrentProccess();
+        		for (int i = minTimeIndex + 1; i < MAX_THREAD_COUNT; i++)
+        		{
+        			if (DuringTimeIndex[minTimeIndex] > DuringTimeIndex[i])
+        				minTimeIndex = i;
+        		}
+        		curThreadCount = minTimeIndex + 1;
+        		FinishAdjustment = true;
+        	}
+        	return;
+        }
+        ```
+        
+        위 코드와 같이 워킹 쓰레드에서 이벤트를 보낸 후부터 모든 쓰레드가 연산을 끝내고 오기 까지의 시간을 구한 뒤 N번씩 더해주고 그 값이 가장 빠른 프레임을 이후 연산의 쓰레드로 구하였습니다.
+        
+        결과는 현제 제 컴퓨터의 여러 프로그램들이 켜진 경우에는 69개의 쓰레드 숫자와
+        
+        580 ~ 610 사이의 프레임까지 나왔습니다.
+        
+        ![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/db479e7c-e2f0-442d-98f9-5f039ada0f16/5c10d813-130e-4a58-bd63-2aa1f1ef8ed4/image.png)
+        
+        하지만 다른 컴퓨터에서 실험 해본 결과 모든 프로그램을 끄고 재시작한 컴퓨터에서 실험한 결과 32개와 64개의 차이는 거의 없다고 나왔습니다.
+        
+        한계점: 하지만 제 코드에서는 처음 한번만 계산을 하기 떄문에 주기적으로 테스트를 하지 않거나 주기적으로 바꾸어 주지 않는 한 처음 쓰레드가 가장 높은 효율을 나올지는 확신할 수 없습니다.
+        
+
+# 결론
+
+CPU 기반의 이미지 프로세싱 성능을 극대화 시키기 위하여
+
+1. 멀티 쓰레드
+2. SIMD
+3. 기타 알고리즘
+
+등 여러가지 기법들을 적절히 조합하고 상호 보완적으로 활용함으로써 7 프레임에서 610프레임까지 큰 폭에 이르는 성능 향상을 거둘 수 있었습니다.
+
+또한 이러한 방법들 이외에도 수 많은 시행 착오와 이러한 결과들을 수행하기 위한 자료 검색, 수 많은 고민 끝에 좋은 결과를 만들어 낼 수 있었습니다.
+
+이에 코드와 다양한 기법들과 생각하는 법 등 많은 공부가 되었고 많은 성장이 된 것 같습니다.
