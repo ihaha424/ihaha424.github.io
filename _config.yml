@@ -2,6 +2,12 @@ title: 개발 노트
 description: 학습 기록
 author: Dongmin
 theme: jekyll-theme-hacker
+include:
+  - study
+collections:
+  study:
+    output: true
+    permalink: /:collection/:name
 markdown: kramdown
 highlighter: rouge
 
